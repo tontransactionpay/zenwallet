@@ -1,0 +1,4 @@
+flask
+pytoniq
+tonsdk
+gunicorn
