@@ -29,7 +29,7 @@ HOST = "0.0.0.0"
 PORT = 5000
 
 MAX_RETRIES = 5
-RECONNECT_DELAY = 1
+RECONNECT_DELAY = 2
 
 # =========================================================
 # GLOBAL EVENT LOOP
@@ -99,6 +99,24 @@ def create_client():
     )
 
 # =========================================================
+# CLOSE CLIENT
+# =========================================================
+
+async def close_client():
+
+    global client
+
+    try:
+
+        if client:
+            await client.close()
+
+    except:
+        pass
+
+    client = None
+
+# =========================================================
 # CONNECT CLIENT
 # =========================================================
 
@@ -106,32 +124,63 @@ async def connect_client():
 
     global client
 
-    try:
+    await close_client()
 
-        if client:
+    last_error = None
+
+    for attempt in range(MAX_RETRIES):
+
+        try:
+
+            client = create_client()
+
+            await client.connect()
+
+            # Test connection
+            await client.get_masterchain_info()
+
+            return client
+
+        except Exception as e:
+
+            last_error = e
 
             try:
-                await client.close()
+                await close_client()
             except:
                 pass
 
-        client = create_client()
+            await asyncio.sleep(
+                RECONNECT_DELAY
+            )
 
-        await client.connect()
+    raise Exception(
+        f"TON LiteServer connection failed: {str(last_error)}"
+    )
+
+# =========================================================
+# CHECK CLIENT HEALTH
+# =========================================================
+
+async def is_client_healthy():
+
+    global client
+
+    try:
+
+        if client is None:
+            return False
+
+        if getattr(client, "writer", None) is None:
+            return False
+
+        await client.get_masterchain_info()
 
         return True
 
     except:
 
         return False
-
-# =========================================================
-# STARTUP
-# =========================================================
-
-loop.run_until_complete(
-    connect_client()
-)
 
 # =========================================================
 # ENSURE CLIENT CONNECTED
@@ -141,41 +190,33 @@ async def ensure_client():
 
     global client
 
-    try:
+    healthy = await is_client_healthy()
 
-        if client is None:
-
-            await connect_client()
-
-        return client
-
-    except:
+    if not healthy:
 
         await connect_client()
 
-        return client
+    return client
 
 # =========================================================
-# SAFE ACCOUNT STATE
+# SAFE LITESERVER REQUEST
 # =========================================================
 
-async def safe_get_account_state(address):
+async def safe_liteserver_request(callback):
 
-    global client
+    last_error = None
 
-    for _ in range(MAX_RETRIES):
+    for attempt in range(MAX_RETRIES):
 
         try:
 
             await ensure_client()
 
-            state = await client.get_account_state(
-                address
-            )
+            return await callback()
 
-            return state
+        except Exception as e:
 
-        except:
+            last_error = e
 
             try:
 
@@ -189,8 +230,22 @@ async def safe_get_account_state(address):
             )
 
     raise Exception(
-        "TON LiteServer unavailable"
+        f"Liteserver request failed: {str(last_error)}"
     )
+
+# =========================================================
+# STARTUP CONNECT
+# =========================================================
+
+try:
+
+    loop.run_until_complete(
+        connect_client()
+    )
+
+except Exception as e:
+
+    print("Startup connection failed:", e)
 
 # =========================================================
 # FORMAT TON
@@ -228,6 +283,19 @@ def validate_address(address_text):
         return False, str(e)
 
 # =========================================================
+# SAFE ACCOUNT STATE
+# =========================================================
+
+async def safe_get_account_state(address):
+
+    return await safe_liteserver_request(
+
+        lambda: client.get_account_state(
+            address
+        )
+    )
+
+# =========================================================
 # CREATE WALLET
 # =========================================================
 
@@ -239,28 +307,36 @@ async def create_wallet():
 
         mnemonic_words = mnemonic_new()
 
-        wallet = await WalletV5R1.from_mnemonic(
+        wallet = await safe_liteserver_request(
 
-            provider=client,
+            lambda: WalletV5R1.from_mnemonic(
 
-            mnemonics=mnemonic_words,
+                provider=client,
 
-            wallet_id=WALLET_ID,
+                mnemonics=mnemonic_words,
 
-            wc=0
+                wallet_id=WALLET_ID,
+
+                wc=0
+            )
         )
 
         bounceable = wallet.address.to_str(
+
             is_user_friendly=True,
+
             is_bounceable=True
         )
 
         non_bounceable = wallet.address.to_str(
+
             is_user_friendly=True,
+
             is_bounceable=False
         )
 
         raw_address = wallet.address.to_str(
+
             is_user_friendly=False
         )
 
@@ -325,16 +401,21 @@ async def get_wallet_balance(address_text):
         )
 
         bounceable = address.to_str(
+
             is_user_friendly=True,
+
             is_bounceable=True
         )
 
         non_bounceable = address.to_str(
+
             is_user_friendly=True,
+
             is_bounceable=False
         )
 
         raw_address = address.to_str(
+
             is_user_friendly=False
         )
 
@@ -482,7 +563,9 @@ def health():
 
     try:
 
-        connected = client is not None
+        connected = loop.run_until_complete(
+            is_client_healthy()
+        )
 
         return response_json(
 
@@ -554,6 +637,7 @@ def wallet_balance_api(address):
     try:
 
         result = loop.run_until_complete(
+
             get_wallet_balance(address)
         )
 
