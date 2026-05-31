@@ -1,4 +1,7 @@
 flask
-pytoniq
+requests
+web3
+tonutils
+ton-core
 tonsdk
 gunicorn
