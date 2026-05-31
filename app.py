@@ -1,17 +1,90 @@
-from flask import Flask, jsonify
+from flask import Flask, request, jsonify
 import asyncio
-import random
-import traceback
-import time
-from decimal import Decimal
+import requests
+import os
+from web3 import Web3
 
-from pytoniq import (
-    LiteClient,
-    Address,
-    WalletV5R1
+from tonutils.clients import ToncenterClient
+from tonutils.contracts import WalletV5R1
+from ton_core import NetworkGlobalID
+from tonsdk.crypto import mnemonic_new
+
+# =========================================================
+# PRICE ORACLE
+# =========================================================
+
+bsc_rpc = "https://bsc-dataseed.binance.org/"
+
+web3 = Web3(
+    Web3.HTTPProvider(
+        bsc_rpc,
+        request_kwargs={"timeout": 15}
+    )
 )
 
-from tonsdk.crypto import mnemonic_new
+pool_address = web3.to_checksum_address(
+    "0x819a26D0C6F3af2B9fe4E9c4BcaC04fCB3ea7f2a"
+)
+
+pool_abi = [
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "getReserves",
+        "outputs": [
+            {"name": "_reserve0", "type": "uint112"},
+            {"name": "_reserve1", "type": "uint112"},
+            {"name": "_blockTimestampLast", "type": "uint32"}
+        ],
+        "type": "function"
+    }
+]
+
+contract = web3.eth.contract(
+    address=pool_address,
+    abi=pool_abi
+)
+
+
+def pancake_price():
+    reserves = contract.functions.getReserves().call()
+
+    reserve_usdt = reserves[0] / (10 ** 18)
+    reserve_ton = reserves[1] / (10 ** 9)
+
+    price = reserve_usdt / reserve_ton
+
+    if price <= 0:
+        raise Exception("Invalid price")
+
+    return float(price)
+
+
+def diadata_price():
+    url = (
+        "https://api.diadata.org/v1/assetQuotation/"
+        "Ton/0x0000000000000000000000000000000000000000"
+    )
+
+    response = requests.get(url, timeout=10)
+    data = response.json()
+
+    return float(data["Price"])
+
+
+def get_ton_price():
+    try:
+        return pancake_price()
+    except Exception:
+        pass
+
+    try:
+        return diadata_price()
+    except Exception:
+        pass
+
+    return 0.0
+
 
 # =========================================================
 # FLASK APP
@@ -19,663 +92,276 @@ from tonsdk.crypto import mnemonic_new
 
 app = Flask(__name__)
 
-# =========================================================
-# SETTINGS
-# =========================================================
 
-WALLET_ID = 698983191
-
-HOST = "0.0.0.0"
-PORT = 5000
-
-MAX_RETRIES = 5
-RECONNECT_DELAY = 2
-
-# =========================================================
-# GLOBAL EVENT LOOP
-# =========================================================
-
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
-# =========================================================
-# GLOBAL CLIENT
-# =========================================================
-
-client = None
-
-# =========================================================
-# AUTO JSON RESPONSE
-# =========================================================
-
-def response_json(
-    success=False,
-    message="",
-    data=None,
-    error=None,
-    status=200
-):
-
-    return jsonify({
-
-        "success": success,
-
-        "message": message,
-
-        "server_time": int(time.time()),
-
-        "data": data if data else {},
-
-        "error": error if error else None
-
-    }), status
-
-# =========================================================
-# FORMAT ERROR
-# =========================================================
-
-def format_error(e):
-
-    return {
-
-        "type": type(e).__name__,
-
-        "message": str(e),
-
-        "traceback": traceback.format_exc()
-    }
-
-# =========================================================
-# CREATE CLIENT
-# =========================================================
-
-def create_client():
-
-    return LiteClient.from_mainnet_config(
-
-        ls_i=random.randint(0, 15),
-
-        trust_level=2
-    )
-
-# =========================================================
-# CLOSE CLIENT
-# =========================================================
-
-async def close_client():
-
-    global client
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
-        if client:
-            await client.close()
-
-    except:
-        pass
-
-    client = None
 
 # =========================================================
-# CONNECT CLIENT
+# TON FUNCTIONS
 # =========================================================
 
-async def connect_client():
-
-    global client
-
-    await close_client()
-
-    last_error = None
-
-    for attempt in range(MAX_RETRIES):
-
-        try:
-
-            client = create_client()
-
-            await client.connect()
-
-            # Test connection
-            await client.get_masterchain_info()
-
-            return client
-
-        except Exception as e:
-
-            last_error = e
-
-            try:
-                await close_client()
-            except:
-                pass
-
-            await asyncio.sleep(
-                RECONNECT_DELAY
-            )
-
-    raise Exception(
-        f"TON LiteServer connection failed: {str(last_error)}"
+async def get_wallet_info(mnemonic_words):
+    client = ToncenterClient(
+        network=NetworkGlobalID.MAINNET
     )
 
-# =========================================================
-# CHECK CLIENT HEALTH
-# =========================================================
-
-async def is_client_healthy():
-
-    global client
+    await client.connect()
 
     try:
-
-        if client is None:
-            return False
-
-        if getattr(client, "writer", None) is None:
-            return False
-
-        await client.get_masterchain_info()
-
-        return True
-
-    except:
-
-        return False
-
-# =========================================================
-# ENSURE CLIENT CONNECTED
-# =========================================================
-
-async def ensure_client():
-
-    global client
-
-    healthy = await is_client_healthy()
-
-    if not healthy:
-
-        await connect_client()
-
-    return client
-
-# =========================================================
-# SAFE LITESERVER REQUEST
-# =========================================================
-
-async def safe_liteserver_request(callback):
-
-    last_error = None
-
-    for attempt in range(MAX_RETRIES):
-
-        try:
-
-            await ensure_client()
-
-            return await callback()
-
-        except Exception as e:
-
-            last_error = e
-
-            try:
-
-                await connect_client()
-
-            except:
-                pass
-
-            await asyncio.sleep(
-                RECONNECT_DELAY
-            )
-
-    raise Exception(
-        f"Liteserver request failed: {str(last_error)}"
-    )
-
-# =========================================================
-# STARTUP CONNECT
-# =========================================================
-
-try:
-
-    loop.run_until_complete(
-        connect_client()
-    )
-
-except Exception as e:
-
-    print("Startup connection failed:", e)
-
-# =========================================================
-# FORMAT TON
-# =========================================================
-
-def format_ton(value):
-
-    try:
-
-        value = Decimal(value)
-
-        return format(
-            value.normalize(),
-            "f"
+        wallet, _, _, _ = WalletV5R1.from_mnemonic(
+            client,
+            " ".join(mnemonic_words)
         )
 
-    except:
-
-        return str(value)
-
-# =========================================================
-# VALIDATE ADDRESS
-# =========================================================
-
-def validate_address(address_text):
-
-    try:
-
-        address = Address(address_text)
-
-        return True, address
-
-    except Exception as e:
-
-        return False, str(e)
-
-# =========================================================
-# SAFE ACCOUNT STATE
-# =========================================================
-
-async def safe_get_account_state(address):
-
-    return await safe_liteserver_request(
-
-        lambda: client.get_account_state(
-            address
-        )
-    )
-
-# =========================================================
-# CREATE WALLET
-# =========================================================
-
-async def create_wallet():
-
-    try:
-
-        await ensure_client()
-
-        mnemonic_words = mnemonic_new()
-
-        wallet = await safe_liteserver_request(
-
-            lambda: WalletV5R1.from_mnemonic(
-
-                provider=client,
-
-                mnemonics=mnemonic_words,
-
-                wallet_id=WALLET_ID,
-
-                wc=0
-            )
-        )
+        await wallet.refresh()
 
         bounceable = wallet.address.to_str(
-
-            is_user_friendly=True,
-
             is_bounceable=True
         )
 
         non_bounceable = wallet.address.to_str(
-
-            is_user_friendly=True,
-
             is_bounceable=False
         )
 
-        raw_address = wallet.address.to_str(
-
+        raw = wallet.address.to_str(
+            is_bounceable=False,
             is_user_friendly=False
         )
 
+        balance_ton = wallet.balance / 1e9
+
+        ton_price = get_ton_price()
+
+        balance_usd = balance_ton * ton_price
+
         return {
-
-            "wallet_version": "v5r1",
-
-            "wallet_id": WALLET_ID,
-
-            "mnemonic": mnemonic_words,
-
-            "mnemonic_text": " ".join(
-                mnemonic_words
-            ),
-
             "addresses": {
-
                 "bounceable": bounceable,
-
                 "non_bounceable": non_bounceable,
-
-                "raw": raw_address
-            }
+                "raw": raw
+            },
+            "balance": {
+                "ton": round(balance_ton, 9),
+                "usd": round(balance_usd, 6)
+            },
+            "ton_price_usd": round(ton_price, 6)
         }
 
-    except Exception as e:
+    finally:
+        await client.close()
 
-        raise Exception(
-            format_error(e)
-        )
 
-# =========================================================
-# GET WALLET BALANCE
-# =========================================================
+async def create_new_wallet():
+    mnemonic_words = mnemonic_new()
 
-async def get_wallet_balance(address_text):
+    client = ToncenterClient(
+        network=NetworkGlobalID.MAINNET
+    )
+
+    await client.connect()
 
     try:
-
-        valid, result = validate_address(
-            address_text
+        wallet, _, _, _ = WalletV5R1.from_mnemonic(
+            client,
+            " ".join(mnemonic_words)
         )
 
-        if not valid:
+        await wallet.refresh()
 
-            raise Exception(
-                f"Invalid TON Address: {result}"
-            )
-
-        address = result
-
-        account_state = await safe_get_account_state(
-            address
-        )
-
-        balance = int(
-            account_state.balance
-        )
-
-        ton_balance = Decimal(balance) / Decimal(
-            "1000000000"
-        )
-
-        bounceable = address.to_str(
-
-            is_user_friendly=True,
-
+        bounceable = wallet.address.to_str(
             is_bounceable=True
         )
 
-        non_bounceable = address.to_str(
-
-            is_user_friendly=True,
-
+        non_bounceable = wallet.address.to_str(
             is_bounceable=False
         )
 
-        raw_address = address.to_str(
-
+        raw = wallet.address.to_str(
+            is_bounceable=False,
             is_user_friendly=False
         )
 
         return {
-
+            "mnemonic": mnemonic_words,
+            "mnemonic_text": " ".join(mnemonic_words),
             "addresses": {
-
                 "bounceable": bounceable,
-
                 "non_bounceable": non_bounceable,
-
-                "raw": raw_address
+                "raw": raw
             },
-
             "balance": {
-
-                "nano": str(balance),
-
-                "ton": format_ton(
-                    ton_balance
-                )
+                "ton": 0.0,
+                "usd": 0.0
             }
         }
 
-    except Exception as e:
+    finally:
+        await client.close()
 
-        raise Exception(
-            format_error(e)
+
+def process_mnemonic_string(mnemonic_str):
+    if not mnemonic_str:
+        raise ValueError("Empty mnemonic")
+
+    words = mnemonic_str.strip().split()
+
+    if len(words) not in (12, 24):
+        raise ValueError(
+            f"Mnemonic must have 12 or 24 words, got {len(words)}"
         )
 
-# =========================================================
-# ERROR HANDLERS
-# =========================================================
-
-@app.errorhandler(404)
-def not_found(e):
-
-    return response_json(
-
-        success=False,
-
-        message="Route Not Found",
-
-        error={
-
-            "type": "NotFound",
-
-            "message": str(e)
-        },
-
-        status=404
+    return run_async(
+        get_wallet_info(words)
     )
 
-@app.errorhandler(405)
-def method_not_allowed(e):
-
-    return response_json(
-
-        success=False,
-
-        message="Method Not Allowed",
-
-        error={
-
-            "type": "MethodNotAllowed",
-
-            "message": str(e)
-        },
-
-        status=405
-    )
-
-@app.errorhandler(500)
-def internal_server_error(e):
-
-    return response_json(
-
-        success=False,
-
-        message="Internal Server Error",
-
-        error={
-
-            "type": "InternalServerError",
-
-            "message": str(e)
-        },
-
-        status=500
-    )
-
-@app.errorhandler(Exception)
-def handle_exception(e):
-
-    return response_json(
-
-        success=False,
-
-        message="Unhandled Exception",
-
-        error=format_error(e),
-
-        status=500
-    )
 
 # =========================================================
-# HOME
+# ROUTES
 # =========================================================
 
 @app.route("/")
 def home():
-
-    return response_json(
-
-        success=True,
-
-        message="TON Wallet API Running",
-
-        data={
-
-            "routes": {
-
-                "create_wallet":
-                "/create_wallet",
-
-                "wallet_balance":
-                "/wallet_balance/<address>",
-
-                "health":
-                "/health"
-            },
-
-            "wallet_version": "v5r1",
-
-            "wallet_id": WALLET_ID
+    return jsonify({
+        "status": "running",
+        "endpoints": {
+            "GET /create_wallet": "Generate new wallet",
+            "GET /wallet_info?mnemonic=...": "Wallet info",
+            "POST /wallet_info": "Wallet info",
+            "GET /health": "Health check"
         }
-    )
+    })
 
-# =========================================================
-# HEALTH
-# =========================================================
 
 @app.route("/health")
 def health():
+    return jsonify({
+        "status": "healthy"
+    })
 
-    try:
 
-        connected = loop.run_until_complete(
-            is_client_healthy()
-        )
-
-        return response_json(
-
-            success=True,
-
-            message="Server Healthy",
-
-            data={
-
-                "client_connected": connected
-            }
-        )
-
-    except Exception as e:
-
-        return response_json(
-
-            success=False,
-
-            message="Health Check Failed",
-
-            error=format_error(e),
-
-            status=500
-        )
-
-# =========================================================
-# CREATE WALLET API
-# =========================================================
-
-@app.route("/create_wallet")
+@app.route("/create_wallet", methods=["GET"])
 def create_wallet_api():
-
     try:
-
-        result = loop.run_until_complete(
-            create_wallet()
+        result = run_async(
+            create_new_wallet()
         )
 
-        return response_json(
-
-            success=True,
-
-            message="Wallet Created Successfully",
-
-            data=result
-        )
+        return jsonify({
+            "success": True,
+            "data": result
+        })
 
     except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
-        return response_json(
 
-            success=False,
-
-            message="Wallet Creation Failed",
-
-            error=format_error(e),
-
-            status=500
-        )
-
-# =========================================================
-# BALANCE API
-# =========================================================
-
-@app.route("/wallet_balance/<path:address>")
-def wallet_balance_api(address):
-
+@app.route("/wallet_info", methods=["POST"])
+def wallet_info_post():
     try:
+        data = request.get_json()
 
-        result = loop.run_until_complete(
+        if not data:
+            return jsonify({
+                "success": False,
+                "error": "Missing JSON body"
+            }), 400
 
-            get_wallet_balance(address)
+        mnemonic = data.get("mnemonic")
+
+        if not mnemonic:
+            return jsonify({
+                "success": False,
+                "error": "Missing mnemonic"
+            }), 400
+
+        result = process_mnemonic_string(
+            mnemonic
         )
 
-        return response_json(
-
-            success=True,
-
-            message="Wallet Balance Fetched",
-
-            data=result
-        )
+        return jsonify({
+            "success": True,
+            "data": result
+        })
 
     except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
-        return response_json(
 
-            success=False,
-
-            message="Failed To Fetch Balance",
-
-            error=format_error(e),
-
-            status=500
+@app.route("/wallet_info", methods=["GET"])
+def wallet_info_get():
+    try:
+        mnemonic = request.args.get(
+            "mnemonic"
         )
 
+        if not mnemonic:
+            return jsonify({
+                "success": False,
+                "error": "Missing mnemonic parameter"
+            }), 400
+
+        result = process_mnemonic_string(
+            mnemonic
+        )
+
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route("/wallet_info/<path:mnemonic>", methods=["GET"])
+def wallet_info_path(mnemonic):
+    try:
+        result = process_mnemonic_string(
+            mnemonic
+        )
+
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
 # =========================================================
-# START SERVER
+# RAILWAY START
 # =========================================================
 
 if __name__ == "__main__":
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
+        )
+    )
 
     app.run(
-
-        host=HOST,
-
-        port=PORT,
-
-        threaded=True,
-
+        host="0.0.0.0",
+        port=port,
         debug=False
     )
